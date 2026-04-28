@@ -6,6 +6,7 @@
     "start": "node ow_bot_v7.1.js"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^0.1.100",
     "discord.js": "^14.16.0",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
