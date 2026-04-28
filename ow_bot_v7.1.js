@@ -1,6 +1,7 @@
-const { Client, GatewayIntentBits, PermissionsBitField } = require('discord.js');
+const { Client, GatewayIntentBits, PermissionsBitField, AttachmentBuilder } = require('discord.js');
 const admin = require('firebase-admin');
 const express = require('express');
+const { renderPersonalCard, renderAbuseCard, renderServerCard, renderShuffleCard } = require('./cards');
 require('dotenv').config();
 
 // [U번 수정] 필수 환경변수 사전 검증 - 모호한 라이브러리 내부 에러 회피
@@ -162,6 +163,8 @@ const saveDB = async (force = false) => {
 const runGC = () => {
     const now = Date.now();
     let removed = 0;
+    let removedDaily = 0;
+    const dailyCutoff = todayKey(-DAILY_RETENTION_DAYS);
     for (const gId in db) {
         for (const uId in db[gId]) {
             if (db[gId][uId].social) {
@@ -172,11 +175,37 @@ const runGC = () => {
                     }
                 }
             }
+            if (db[gId][uId].daily) {
+                for (const dKey in db[gId][uId].daily) {
+                    if (dKey < dailyCutoff) {
+                        delete db[gId][uId].daily[dKey];
+                        removedDaily++;
+                    }
+                }
+            }
         }
     }
-    console.log(`[GC] 6개월 초과 소셜 데이터 정리 완료 (${removed}건)`);
+    console.log(`[GC] 6개월 초과 소셜 ${removed}건 / ${DAILY_RETENTION_DAYS}일 초과 일별 ${removedDaily}건 정리`);
     // [HH번 수정] 정리 결과를 디스크에 반영해야 재시작 후에도 유지됨
-    if (removed > 0) saveDB();
+    if (removed > 0 || removedDaily > 0) saveDB();
+};
+
+// V8.4: 일별 통계 - 차트용 시계열 데이터 적재
+// db[gId][uId].daily[YYYY-MM-DD] = { inGameMs, shuffleCount, partnersSet }
+const DAILY_RETENTION_DAYS = 30;
+const todayKey = (offsetDays = 0) => {
+    const d = new Date();
+    d.setDate(d.getDate() + offsetDays);
+    return d.toISOString().slice(0, 10); // YYYY-MM-DD
+};
+const ensureDailyEntry = (entry, dateKey = todayKey()) => {
+    if (!entry.daily) entry.daily = {};
+    if (!entry.daily[dateKey]) entry.daily[dateKey] = { inGameMs: 0, shuffleCount: 0, partnersSet: {} };
+    const d = entry.daily[dateKey];
+    if (typeof d.inGameMs !== 'number') d.inGameMs = 0;
+    if (typeof d.shuffleCount !== 'number') d.shuffleCount = 0;
+    if (!d.partnersSet || typeof d.partnersSet !== 'object') d.partnersSet = {};
+    return d;
 };
 
 const getDB = (gId, uId) => {
@@ -185,9 +214,14 @@ const getDB = (gId, uId) => {
         db[gId][uId] = {
             roles: [], currentRole: null, social: {},
             undoCount: 0, lastUndoAt: 0,
+            undoUseCount: 0, lastUndoUseAt: 0,
             summonCount: 0, lastSummonAt: 0,
             activeRoles: null, followup: null,
-            seenGameCycle: false
+            seenGameCycle: false,
+            daily: {},
+            roleStats: { tank: 0, damage: 0, support: 0 },
+            hourly: {},
+            firstPlayedAt: 0
         };
     } else {
         // [EEE번 수정] Firebase는 빈 객체/배열을 저장 안 함 → 로드 시 누락 필드 보강
@@ -205,6 +239,17 @@ const getDB = (gId, uId) => {
         if (e.followup === undefined) e.followup = null;
         // 게임 사이클 관찰 게이트: 채널 입장 후 게임중→온라인 전환 1회 관찰됐는지
         if (typeof e.seenGameCycle !== 'boolean') e.seenGameCycle = false;
+        // V8.4 일별 통계 (차트용)
+        if (typeof e.undoUseCount !== 'number') e.undoUseCount = 0;
+        if (typeof e.lastUndoUseAt !== 'number') e.lastUndoUseAt = 0;
+        if (!e.daily || typeof e.daily !== 'object') e.daily = {};
+        // V8.5: 역할 분포 / 시간대 / 첫 활동
+        if (!e.roleStats || typeof e.roleStats !== 'object') e.roleStats = {};
+        if (typeof e.roleStats.tank !== 'number') e.roleStats.tank = 0;
+        if (typeof e.roleStats.damage !== 'number') e.roleStats.damage = 0;
+        if (typeof e.roleStats.support !== 'number') e.roleStats.support = 0;
+        if (!e.hourly || typeof e.hourly !== 'object') e.hourly = {};
+        if (typeof e.firstPlayedAt !== 'number') e.firstPlayedAt = 0;
     }
     return db[gId][uId];
 };
@@ -460,6 +505,7 @@ async function smartAssign(member, roles = null) {
             if (member.voice?.channel?.id === best.room.id) {
                 console.warn(`[BB번] HTTP 실패하나 실제 이동 성공 확인: ${member.id}`);
                 addShuffleMember(gId, best.room.id, member.id); // [MMM번] 셔플 멤버 등록
+                data.roleStats[chosenRole] = (data.roleStats[chosenRole] || 0) + 1;
                 saveDB();
                 return '✅';
             }
@@ -474,6 +520,8 @@ async function smartAssign(member, roles = null) {
         }
         // [MMM번 수정] 봇이 배정한 사람을 셔플 멤버 리스트에 추가
         addShuffleMember(gId, best.room.id, member.id);
+        // V8.5: 역할 분포 카운트 (입장 시 1회)
+        data.roleStats[chosenRole] = (data.roleStats[chosenRole] || 0) + 1;
         saveDB();
         return '✅';
 
@@ -766,8 +814,11 @@ function finishRotation(gId, sourceChannel, players, movements) {
     for (const cid of affectedChannels) setCooldown(gId, cid);
 
     const now = Date.now();
+    const dateKey = todayKey();
     players.forEach(m1 => {
         const d1 = getDB(gId, m1.id);
+        // V8.4: 일별 셔플 카운트
+        ensureDailyEntry(d1, dateKey).shuffleCount += 1;
         players.forEach(m2 => {
             if (m1.id !== m2.id) {
                 // [KKK번 수정] ensureSocialEntry로 durationMs 보존 (덮어쓰기 X)
@@ -1010,6 +1061,58 @@ const formatRelativeTime = (timestamp) => {
     if (minutes > 0) return `${minutes}분 전`;
     return '방금 전';
 };
+// V8.5: 통계 계산 헬퍼들
+const computeServerRank = (gId, uid, key) => {
+    // key: 'totalInGameMs' | 'totalShuffles'
+    const guildData = db[gId] || {};
+    const ranking = Object.entries(guildData)
+        .filter(([id]) => /^\d{17,20}$/.test(id))
+        .map(([id, e]) => {
+            if (!e?.daily) return { id, score: 0 };
+            const score = key === 'totalInGameMs'
+                ? Object.values(e.daily).reduce((s, d) => s + (d?.inGameMs || 0), 0)
+                : Object.values(e.daily).reduce((s, d) => s + (d?.shuffleCount || 0), 0);
+            return { id, score };
+        })
+        .filter(r => r.score > 0)
+        .sort((a, b) => b.score - a.score);
+    const idx = ranking.findIndex(r => r.id === uid);
+    return idx >= 0 ? { rank: idx + 1, total: ranking.length } : { rank: null, total: ranking.length };
+};
+const computeStreak = (daily) => {
+    if (!daily) return 0;
+    let streak = 0;
+    for (let i = 0; i < 365; i++) {
+        const d = new Date();
+        d.setDate(d.getDate() - i);
+        const k = d.toISOString().slice(0, 10);
+        const entry = daily[k];
+        if (entry && (entry.inGameMs > 0 || entry.shuffleCount > 0)) streak++;
+        else if (i > 0) break;  // 오늘은 활동 없을 수 있으니 1일째까지는 봐줌
+    }
+    return streak;
+};
+const computeWeekdayBreakdown = (daily) => {
+    // 0=일, 1=월, ..., 6=토
+    const buckets = [0, 0, 0, 0, 0, 0, 0];
+    const counts = [0, 0, 0, 0, 0, 0, 0];
+    for (const [dateKey, entry] of Object.entries(daily || {})) {
+        const dow = new Date(dateKey + 'T00:00:00').getDay();
+        if (Number.isNaN(dow)) continue;
+        buckets[dow] += entry?.inGameMs || 0;
+        counts[dow] += 1;
+    }
+    // 평균 (해당 요일이 며칠 있었는지로 나눔)
+    return buckets.map((sum, i) => counts[i] > 0 ? sum / counts[i] : 0);
+};
+const findLastPlayed = (data) => {
+    let max = 0;
+    for (const s of Object.values(data?.social || {})) {
+        if (s?.lastPlayed > max) max = s.lastPlayed;
+    }
+    return max;
+};
+
 const resolveUserName = async (guild, uid) => {
     try {
         const m = await guild.members.fetch(uid);
@@ -1020,12 +1123,69 @@ const resolveUserName = async (guild, uid) => {
 };
 
 // --- [ 명령어 처리 ] ---
+// V8.5: !셔플설명 - 사용자용 사용 가이드 (디스코드 마크다운으로 렌더)
+const HELP_TEXT_PART1 = `# 🎮 오버워치 봇 사용법
+
+## 📌 처음 사용하기 (2단계)
+
+**1단계** — 음성채널 입장 후 \`!랜덤 [내 가능 역할]\`
+\`\`\`
+!랜덤 탱딜힐
+\`\`\`
+봇이 빈자리 있는 게임방으로 옮겨주고 역할을 배정합니다.
+- \`!랜덤 탱\` — 탱커만
+- \`!랜덤 딜힐\` — 딜러 또는 힐러
+- \`!랜덤 탱딜힐\` — 셋 다 가능
+
+**2단계** — 게임 시작
+마지막 셔플 후 1시간이 지난 시점에 게임이 끝나 있으면 자동 셔플 (게임 중이면 끝날 때까지 대기).
+
+> 💡 **팁**: \`!역할변경 탱딜힐\` 한 번만 등록해두면 대기실 입장만으로 자동 배정됩니다.
+> 💡 **역할 입력 형식**: \`탱딜힐\`, \`탱/딜/힐\`, \`탱,딜,힐\`, \`탱 딜 힐\` 다 동일 동작.`;
+
+const HELP_TEXT_PART2 = `## 🎯 명령어 목록
+
+**역할/배정**
+- \`!역할변경 탱딜힐\` — 영구 역할 등록 (1회)
+- \`!역할\` — 현재 배정된 역할 확인
+- \`!랜덤\` / \`!랜덤 탱\` — 자동 / 일회성 배정
+- \`!변경 탱딜\` — \`!랜덤\` 실패 직후 다른 역할로 재시도 (5분 내)
+- \`!혼자\` — \`!랜덤\` 실패 직후 빈 방 혼자 입장 (5분 내)
+
+**이동**
+- \`!되돌려\` — 직전 셔플로 이동한 **전원** 원래 방 복귀 (5분 내)
+- \`!소환 @사용자\` — 다른 방의 사람을 내 음성채널로
+
+## 🔀 자동 셔플 조건
+
+**셔플 발생:** 3명 이상 + 모두 게임 안 함 + 쿨다운(1시간) 경과
+**보류:** 누군가 게임 중 / 전원 오프라인 / 오프라인 섞여있고 온라인이 아직 한판 안 마침
+
+**분할:** 4명 이상 + 빈 방 있으면 양쪽 게임 가능하도록 일부 이동
+
+## ❓ 자주 보는 상황
+
+**"❌ 배정 가능한 자리가 없습니다"** → \`!변경 [추천 역할]\` 또는 \`!혼자\`
+**셔플이 마음에 안 든다** → 5분 내 \`!되돌려\`
+**친구 데려오기** → \`!소환 @친구\`
+**역할 바꾸기** → 영구 \`!역할변경 딜힐\` / 일회성 \`!랜덤 딜힐\``;
+
 client.on('messageCreate', async (msg) => {
     if (msg.author.bot) return;
     const gId = msg.guild?.id;
     if (!gId) return;
 
     const args = msg.content.trim().split(/\s+/);
+
+    if (args[0] === '!셔플설명') {
+        try {
+            await msg.reply(HELP_TEXT_PART1);
+            await msg.channel.send(HELP_TEXT_PART2);
+        } catch (e) {
+            console.warn('[!셔플설명] 전송 실패:', e?.message || e);
+        }
+        return;
+    }
 
     if (args[0] === '!역할변경') {
         const r = [];
@@ -1140,6 +1300,7 @@ client.on('messageCreate', async (msg) => {
             data.activeRoles = followupRoles;  // 이 세션 동안 이 역할셋 유지
             data.followup = null;
             addShuffleMember(gId, targetRoom.id, msg.author.id);
+            data.roleStats[chosenRole] = (data.roleStats[chosenRole] || 0) + 1;
             saveDB();
             await safeReply(msg, `✅ ${targetRoom.name}에 ${ROLE_NAMES[chosenRole]}로 혼자 대기 중`);
         } catch (e) {
@@ -1261,80 +1422,267 @@ client.on('messageCreate', async (msg) => {
         }
     }
 
-    // [LLL번 수정] !통계 - 본인이 같이 한 사람 Top 5 (시간 기준 디폴트)
+    // V8.4: !통계 - 카드 이미지로 출력
     // 사용법: !통계 / !통계 횟수 / !통계 @user
     if (args[0] === '!통계') {
         const data = getDB(gId, msg.author.id);
         const target = msg.mentions.users?.first();
 
-        // 특정 사용자와의 누적
+        // @user — 1:1 통계는 텍스트 캡션 + 카드 같이 첨부
+        let comparisonCaption = null;
         if (target) {
             if (target.bot) return safeReply(msg, '⚠️ 봇과의 통계는 없습니다.');
             const s = data.social?.[target.id];
-            if (!s || (!s.count && !s.durationMs)) {
-                return safeReply(msg, `📊 ${target.username}님과 함께 한 기록이 없습니다.`);
+            comparisonCaption = (s && (s.count || s.durationMs))
+                ? `📊 **${msg.author.username} ↔ ${target.username}** — 같이 ${s.count || 0}회 / ${formatDuration(s.durationMs)} (마지막: ${formatRelativeTime(s.lastPlayed)})`
+                : `📊 **${msg.author.username} ↔ ${target.username}** — 함께 한 기록 없음`;
+        }
+
+        try {
+            const sortByCount = args[1] === '횟수';
+            const sortKey = sortByCount ? 'count' : 'durationMs';
+            // count 또는 durationMs 중 하나라도 값이 있으면 포함, 정렬만 선택한 키로
+            const topEntries = Object.entries(data.social || {})
+                .filter(([, s]) => (s?.count || 0) > 0 || (s?.durationMs || 0) > 0)
+                .sort(([, a], [, b]) => (b[sortKey] || 0) - (a[sortKey] || 0))
+                .slice(0, 5);
+            const topPartners = await Promise.all(topEntries.map(async ([uid, s]) => ({
+                name: await resolveUserName(msg.guild, uid),
+                count: s.count || 0,
+                durationMs: s.durationMs || 0
+            })));
+
+            // 최근 14일 일별 (오래된 → 최신)
+            const dailyArr = [];
+            for (let i = 13; i >= 0; i--) {
+                const date = todayKey(-i);
+                const d = data.daily?.[date] || {};
+                dailyArr.push({
+                    date,
+                    inGameMs: d.inGameMs || 0,
+                    shuffleCount: d.shuffleCount || 0
+                });
             }
-            return safeReply(msg,
-                `📊 **${msg.author.username} ↔ ${target.username}**\n` +
-                `• 같이 한 횟수: ${s.count || 0}회\n` +
-                `• 같이 한 시간: ${formatDuration(s.durationMs)}\n` +
-                `• 마지막: ${formatRelativeTime(s.lastPlayed)}`
-            );
-        }
 
-        // Top N
-        const sortByCount = args[1] === '횟수';
-        const sortKey = sortByCount ? 'count' : 'durationMs';
-        const entries = Object.entries(data.social || {})
-            .filter(([, s]) => (s?.[sortKey] || 0) > 0)
-            .sort(([, a], [, b]) => (b[sortKey] || 0) - (a[sortKey] || 0))
-            .slice(0, 5);
+            // 총 메트릭
+            const totalPartners = Object.values(data.social || {})
+                .filter(s => (s?.count || 0) > 0 || (s?.durationMs || 0) > 0).length;
+            const totalShuffles = Object.values(data.daily || {})
+                .reduce((sum, d) => sum + (d?.shuffleCount || 0), 0);
+            const totalInGameMs = Object.values(data.daily || {})
+                .reduce((sum, d) => sum + (d?.inGameMs || 0), 0);
 
-        if (entries.length === 0) {
-            return safeReply(msg, '📊 아직 같이 한 기록이 없습니다.');
+            // 활동 요약: 최장일 / 가장 활발한 요일 / 최근 7일 합 / 활동일 평균
+            const dailyValues = Object.values(data.daily || {});
+            const peakDayMs = dailyValues.reduce((max, d) => Math.max(max, d?.inGameMs || 0), 0);
+            const wb = computeWeekdayBreakdown(data.daily);
+            const peakWeekday = wb.some(v => v > 0) ? wb.indexOf(Math.max(...wb)) : null;
+            const last7DaysMs = dailyArr.slice(-7).reduce((s, d) => s + (d.inGameMs || 0), 0);
+            const activeDays = dailyValues.filter(d => (d?.inGameMs || 0) > 0).length;
+            const avgPerActiveDayMs = activeDays > 0 ? totalInGameMs / activeDays : 0;
+
+            const png = await renderPersonalCard({
+                username: msg.member?.displayName || msg.author.username,
+                joinedAt: msg.member?.joinedTimestamp,
+                avatarURL: msg.author.displayAvatarURL({ extension: 'png', size: 128 }),
+                totalPartners, totalShuffles, totalInGameMs,
+                topPartners,
+                daily: dailyArr,
+                currentRole: data.currentRole,
+                roles: data.roles,
+                // V8.5 추가 필드
+                undoCount: data.undoCount || 0,
+                undoUseCount: data.undoUseCount || 0,
+                summonCount: data.summonCount || 0,
+                serverRank: computeServerRank(gId, msg.author.id, 'totalInGameMs'),
+                lastPlayed: findLastPlayed(data),
+                firstPlayedAt: data.firstPlayedAt || 0,
+                streak: computeStreak(data.daily),
+                weekdayBreakdown: wb,
+                hourly: data.hourly || {},
+                activitySummary: { peakDayMs, peakWeekday, last7DaysMs, avgPerActiveDayMs }
+            });
+
+            await msg.reply({
+                content: comparisonCaption || undefined,
+                files: [new AttachmentBuilder(png, { name: 'stats.png' })]
+            });
+        } catch (e) {
+            console.error('[!통계] 카드 렌더 실패:', e?.message || e);
+            await safeReply(msg, '⚠️ 통계 카드 생성 실패');
         }
-        const lines = await Promise.all(entries.map(async ([uid, s], i) => {
-            const name = await resolveUserName(msg.guild, uid);
-            return `${i + 1}. ${name} — ${s.count || 0}회 / ${formatDuration(s.durationMs)}`;
-        }));
-        const sortLabel = sortByCount ? '횟수' : '시간';
-        const hint = sortByCount ? '`!통계`로 시간 기준 보기' : '`!통계 횟수`로 횟수 기준 보기';
-        await safeReply(msg,
-            `📊 **${msg.author.username}님이 같이 한 사람 Top ${entries.length} (${sortLabel} 기준)**\n` +
-            lines.join('\n') + `\n\n💡 ${hint} / \`!통계 @사용자\`로 1:1 조회`
-        );
     }
 
-    // [LLL번 수정] !남용 - 길드 내 되돌리기/소환 누적 Top 5 (남용 추적)
+    // V8.4: !남용 - 카드 이미지로 출력 (기록 없어도 카드 렌더)
     if (args[0] === '!남용') {
         const guildData = db[gId] || {};
-        // 메타 키(_cooldowns, _lastShuffle 등) 제외, 실제 user entry만
         const userEntries = Object.entries(guildData)
             .filter(([uid]) => /^\d{17,20}$/.test(uid))
             .filter(([, e]) => e && (e.undoCount > 0 || e.undoUseCount > 0 || e.summonCount > 0));
 
-        if (userEntries.length === 0) {
-            return safeReply(msg, '📊 되돌리기/소환 기록이 아직 없습니다.');
+        try {
+            const buildTop = async (key, lastKey) => {
+                const top = userEntries
+                    .filter(([, e]) => (e[key] || 0) > 0)
+                    .sort(([, a], [, b]) => (b[key] || 0) - (a[key] || 0))
+                    .slice(0, 5);
+                return Promise.all(top.map(async ([uid, e]) => ({
+                    name: await resolveUserName(msg.guild, uid),
+                    count: e[key],
+                    lastAt: e[lastKey]
+                })));
+            };
+
+            const [undoTop, undoUseTop, summonTop] = await Promise.all([
+                buildTop('undoCount', 'lastUndoAt'),
+                buildTop('undoUseCount', 'lastUndoUseAt'),
+                buildTop('summonCount', 'lastSummonAt')
+            ]);
+
+            const png = await renderAbuseCard({
+                guildName: msg.guild.name,
+                undoTop, undoUseTop, summonTop
+            });
+            await msg.reply({ files: [new AttachmentBuilder(png, { name: 'abuse.png' })] });
+        } catch (e) {
+            console.error('[!남용] 카드 렌더 실패:', e?.message || e);
+            await safeReply(msg, '⚠️ 남용 통계 카드 생성 실패');
         }
+    }
 
-        const buildTop = async (key, lastKey, label, emoji) => {
-            const top = userEntries
-                .filter(([, e]) => (e[key] || 0) > 0)
-                .sort(([, a], [, b]) => (b[key] || 0) - (a[key] || 0))
+    // V8.5: !서버통계 - 서버 전체 활동 요약
+    if (args[0] === '!서버통계') {
+        try {
+            const guildData = db[gId] || {};
+            const userEntries = Object.entries(guildData)
+                .filter(([uid]) => /^\d{17,20}$/.test(uid));
+
+            const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
+            const now = Date.now();
+            const activeUsers7d = userEntries.filter(([, e]) => {
+                if (!e?.daily) return false;
+                return Object.entries(e.daily).some(([dKey]) => {
+                    const t = new Date(dKey + 'T00:00:00').getTime();
+                    return now - t < SEVEN_DAYS;
+                });
+            }).length;
+
+            // 총합 (더블카운트 방지: 시간은 sum, 셔플도 sum — 셔플은 본래 사람당 +1이라 OK)
+            let totalInGameMs = 0, totalShuffles = 0;
+            const aggRoleStats = { tank: 0, damage: 0, support: 0 };
+            const aggHourly = {};
+            for (const [, e] of userEntries) {
+                for (const d of Object.values(e?.daily || {})) {
+                    totalInGameMs += d?.inGameMs || 0;
+                    totalShuffles += d?.shuffleCount || 0;
+                }
+                for (const k of ['tank', 'damage', 'support']) {
+                    aggRoleStats[k] += e?.roleStats?.[k] || 0;
+                }
+                for (const [h, v] of Object.entries(e?.hourly || {})) {
+                    aggHourly[h] = (aggHourly[h] || 0) + (v || 0);
+                }
+            }
+
+            // Top 10 by inGameMs
+            const topPlayersRaw = userEntries
+                .map(([uid, e]) => {
+                    const inGameMs = Object.values(e?.daily || {}).reduce((s, d) => s + (d?.inGameMs || 0), 0);
+                    const shuffleCount = Object.values(e?.daily || {}).reduce((s, d) => s + (d?.shuffleCount || 0), 0);
+                    return { uid, inGameMs, shuffleCount };
+                })
+                .filter(p => p.inGameMs > 0)
+                .sort((a, b) => b.inGameMs - a.inGameMs)
+                .slice(0, 10);
+            const topPlayers = await Promise.all(topPlayersRaw.map(async p => ({
+                name: await resolveUserName(msg.guild, p.uid),
+                inGameMs: p.inGameMs,
+                shuffleCount: p.shuffleCount
+            })));
+
+            // 14일 일별 합계
+            const dailyTotals = [];
+            for (let i = 13; i >= 0; i--) {
+                const date = todayKey(-i);
+                let inGameMs = 0, shuffleCount = 0;
+                for (const [, e] of userEntries) {
+                    const d = e?.daily?.[date];
+                    if (d) {
+                        inGameMs += d.inGameMs || 0;
+                        shuffleCount += d.shuffleCount || 0;
+                    }
+                }
+                dailyTotals.push({ date, inGameMs, shuffleCount });
+            }
+
+            const png = await renderServerCard({
+                guildName: msg.guild.name,
+                totalUsers: userEntries.length,
+                activeUsers7d,
+                totalInGameMs,
+                totalShuffles,
+                topPlayers,
+                roleStats: aggRoleStats,
+                hourly: aggHourly,
+                dailyTotals
+            });
+            await msg.reply({ files: [new AttachmentBuilder(png, { name: 'server.png' })] });
+        } catch (e) {
+            console.error('[!서버통계] 카드 렌더 실패:', e?.message || e);
+            await safeReply(msg, '⚠️ 서버 통계 카드 생성 실패');
+        }
+    }
+
+    // V8.5: !셔플통계 - 셔플 분석
+    if (args[0] === '!셔플통계') {
+        try {
+            const guildData = db[gId] || {};
+            const userEntries = Object.entries(guildData)
+                .filter(([uid]) => /^\d{17,20}$/.test(uid));
+
+            // 일별 셔플 합 (14일)
+            const dailyShuffles = [];
+            for (let i = 13; i >= 0; i--) {
+                const date = todayKey(-i);
+                let count = 0;
+                for (const [, e] of userEntries) {
+                    count += e?.daily?.[date]?.shuffleCount || 0;
+                }
+                dailyShuffles.push({ date, count });
+            }
+
+            // 본 봇은 셔플 1번에 평균 4명 휘말림 가정 → 발생 수 추정
+            const totalSessions = dailyShuffles.reduce((s, d) => s + d.count, 0); // 사람-셔플 누적
+            const totalShuffles = Math.round(totalSessions / 4); // 발생 수 추정
+            const days = dailyShuffles.filter(d => d.count > 0).length || 1;
+            const avgShufflePerDay = totalSessions / days;
+
+            const mostShuffledRaw = userEntries
+                .map(([uid, e]) => ({
+                    uid,
+                    count: Object.values(e?.daily || {}).reduce((s, d) => s + (d?.shuffleCount || 0), 0)
+                }))
+                .filter(p => p.count > 0)
+                .sort((a, b) => b.count - a.count)
                 .slice(0, 5);
-            if (top.length === 0) return `${emoji} **${label}**: 기록 없음`;
-            const lines = await Promise.all(top.map(async ([uid, e], i) => {
-                const name = await resolveUserName(msg.guild, uid);
-                return `${i + 1}. ${name} — ${e[key]}회 (${formatRelativeTime(e[lastKey])})`;
-            }));
-            return `${emoji} **${label} Top ${top.length}**\n${lines.join('\n')}`;
-        };
+            const mostShuffled = await Promise.all(mostShuffledRaw.map(async p => ({
+                name: await resolveUserName(msg.guild, p.uid),
+                count: p.count
+            })));
 
-        const undoText = await buildTop('undoCount', 'lastUndoAt', '되돌리기 당함', '↩️');
-        const undoUseText = await buildTop('undoUseCount', 'lastUndoUseAt', '되돌리기 사용', '🔁');
-        const summonText = await buildTop('summonCount', 'lastSummonAt', '소환', '📢');
-
-        await safeReply(msg, `📊 **남용 통계**\n\n${undoText}\n\n${undoUseText}\n\n${summonText}`);
+            const png = await renderShuffleCard({
+                guildName: msg.guild.name,
+                totalShuffles,
+                totalSessions,
+                avgShufflePerDay,
+                mostShuffled,
+                dailyShuffles
+            });
+            await msg.reply({ files: [new AttachmentBuilder(png, { name: 'shuffle.png' })] });
+        } catch (e) {
+            console.error('[!셔플통계] 카드 렌더 실패:', e?.message || e);
+            await safeReply(msg, '⚠️ 셔플 통계 카드 생성 실패');
+        }
     }
 });
 
@@ -1430,13 +1778,22 @@ const samplePlaytime = () => {
             );
             if (inGame.length < 2) continue;
             const now = Date.now();
+            const dateKey = todayKey();
+            const hourKey = String(new Date().getHours());
             for (const a of inGame) {
                 const da = getDB(gId, a.id);
+                // V8.4: 일별 게임 시간 + 그날 같이 한 사람 set
+                const daily = ensureDailyEntry(da, dateKey);
+                daily.inGameMs += PLAYTIME_SAMPLE_MS;
+                // V8.5: 시간대별 누적 + 첫 활동 시각
+                da.hourly[hourKey] = (da.hourly[hourKey] || 0) + PLAYTIME_SAMPLE_MS;
+                if (!da.firstPlayedAt) da.firstPlayedAt = now;
                 for (const b of inGame) {
                     if (a.id === b.id) continue;
                     const s = ensureSocialEntry(da, b.id);
                     s.durationMs += PLAYTIME_SAMPLE_MS;
                     s.lastPlayed = now;
+                    daily.partnersSet[b.id] = true;
                 }
             }
         }
