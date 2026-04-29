@@ -74,6 +74,10 @@ const CONFIG = {
     MIN_PLAYERS_TO_ROTATE: 3     // 셔플 트리거 최소 인원 - 3 미만이면 셔플 후 소스에 1명만 남게 됨
 };
 
+// !꿍소환 / !꿍이동 — 호출자/대상 ID 고정 (멘션 미지원)
+const KKUNG_CALLER_ID = '792592582441959485';   // 명령을 칠 수 있는 유저
+const KKUNG_TARGET_ID = '394359842053292032';   // 이동되는 유저 (항상 고정)
+
 // [II번 수정] CONFIG.GUILDS 키가 placeholder('서버ID_1' 등)면 봇이 모든 이벤트를 무음 무시
 // → startup 시 fail-fast로 명확한 에러 출력
 for (const key of Object.keys(CONFIG.GUILDS)) {
@@ -1422,6 +1426,83 @@ client.on('messageCreate', async (msg) => {
         }
     }
 
+    // !꿍소환 — 고정 대상(KKUNG_TARGET_ID)을 호출자 음성채널로 (KKUNG_CALLER_ID만 동작)
+    if (args[0] === '!꿍소환') {
+        if (msg.author.id !== KKUNG_CALLER_ID) return;
+        if (!msg.member?.voice?.channel) {
+            return safeReply(msg, '⚠️ 먼저 음성 채널에 입장해주세요.');
+        }
+        const target = msg.guild.members.cache.get(KKUNG_TARGET_ID)
+            || await msg.guild.members.fetch(KKUNG_TARGET_ID).catch(() => null);
+        if (!target) return safeReply(msg, '⚠️ 대상 유저를 서버에서 찾을 수 없습니다.');
+        if (!target.voice?.channel) return safeReply(msg, `⚠️ ${target.user.username}님이 음성 채널에 없습니다.`);
+        if (target.voice.channel.id === msg.member.voice.channel.id) {
+            return safeReply(msg, `⚠️ ${target.user.username}님은 이미 같은 채널에 있습니다.`);
+        }
+        const dest = msg.member.voice.channel;
+        if (!dest.permissionsFor(client.user).has(PermissionsBitField.Flags.MoveMembers)) {
+            return safeReply(msg, `⚠️ 봇 권한 부족 (${dest.name} MoveMembers 필요)`);
+        }
+        try {
+            await target.voice.setChannel(dest.id);
+            await safeReply(msg, `📢 ${target.user.username} → ${dest.name} (꿍소환)`);
+            console.log(`[꿍소환] by ${msg.author.tag} → ${target.user.tag} @ ${dest.name}`);
+        } catch (e) {
+            console.error(`[꿍소환] 실패:`, e.message);
+            await safeReply(msg, `⚠️ 꿍소환 실패: ${e.message}`);
+        }
+    }
+
+    // !꿍이동 (인원 최다) / !꿍이동 [방이름] (지정 방) — 고정 대상 이동, KKUNG_CALLER_ID만 동작
+    if (args[0] === '!꿍이동') {
+        if (msg.author.id !== KKUNG_CALLER_ID) return;
+        const target = msg.guild.members.cache.get(KKUNG_TARGET_ID)
+            || await msg.guild.members.fetch(KKUNG_TARGET_ID).catch(() => null);
+        if (!target) return safeReply(msg, '⚠️ 대상 유저를 서버에서 찾을 수 없습니다.');
+        if (!target.voice?.channel) return safeReply(msg, `⚠️ ${target.user.username}님이 음성 채널에 없습니다.`);
+
+        const roomName = args.slice(1).join(' ').trim();
+        const allVoice = [...msg.guild.channels.cache.values()].filter(c => c.isVoiceBased?.());
+
+        let dest;
+        if (roomName) {
+            const lower = roomName.toLowerCase();
+            let match = allVoice.filter(c => c.name === roomName);
+            if (match.length === 0) match = allVoice.filter(c => c.name.toLowerCase().includes(lower));
+            if (match.length === 0) {
+                return safeReply(msg, `⚠️ '${roomName}' 음성 채널을 찾을 수 없습니다.`);
+            }
+            if (match.length > 1) {
+                return safeReply(msg, `⚠️ '${roomName}' 일치 채널 여러 개: ${match.map(c => c.name).join(', ')}`);
+            }
+            dest = match[0];
+        } else {
+            const candidates = allVoice.filter(c => c.id !== target.voice.channel.id && c.members.size > 0);
+            if (!candidates.length) {
+                return safeReply(msg, '⚠️ 사람이 있는 다른 음성 채널이 없습니다.');
+            }
+            const maxSize = Math.max(...candidates.map(c => c.members.size));
+            const top = candidates.filter(c => c.members.size === maxSize);
+            dest = top[Math.floor(Math.random() * top.length)];
+        }
+
+        if (target.voice.channel.id === dest.id) {
+            return safeReply(msg, `⚠️ ${target.user.username}님은 이미 ${dest.name}에 있습니다.`);
+        }
+        if (!dest.permissionsFor(client.user).has(PermissionsBitField.Flags.MoveMembers)) {
+            return safeReply(msg, `⚠️ 봇 권한 부족 (${dest.name} MoveMembers 필요)`);
+        }
+        try {
+            await target.voice.setChannel(dest.id);
+            const mode = roomName ? '지정' : `최다 ${dest.members.size}명`;
+            await safeReply(msg, `🚚 ${target.user.username} → ${dest.name} (꿍이동, ${mode})`);
+            console.log(`[꿍이동] by ${msg.author.tag}: ${target.user.tag} → ${dest.name} (${mode})`);
+        } catch (e) {
+            console.error(`[꿍이동] 실패:`, e.message);
+            await safeReply(msg, `⚠️ 꿍이동 실패: ${e.message}`);
+        }
+    }
+
     // V8.4: !통계 - 카드 이미지로 출력
     // 사용법: !통계 / !통계 횟수 / !통계 @user
     if (args[0] === '!통계') {
@@ -1770,13 +1851,14 @@ const samplePlaytime = () => {
         for (const roomId of guildConfig.GAME_ROOMS) {
             const room = guild.channels.cache.get(roomId);
             if (!room) continue;
-            // [MMM번 수정] 구경꾼 제외 - 셔플 멤버만 같이 한 시간 카운트
+            // 셔플 멤버 = 봇이 게임 세션으로 배정한 사람만 카운트
+            // presence 검증을 빼서 오프라인 멤버와 같이 한 시간도 기록됨
             const inGame = [...room.members.values()].filter(m =>
-                !m.user.bot && _isInGame(m) &&
+                !m.user.bot &&
                 db[gId]?.[m.id]?.currentRole &&
                 isShuffleMember(gId, roomId, m.id)
             );
-            if (inGame.length < 2) continue;
+            if (inGame.length < 1) continue;
             const now = Date.now();
             const dateKey = todayKey();
             const hourKey = String(new Date().getHours());
